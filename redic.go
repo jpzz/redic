@@ -3,11 +3,9 @@ package redic
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
-	"math"
-	"net"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -15,6 +13,45 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
+)
+
+var nonNetworkErrors = []error{
+	redis.ErrNil,
+	context.Canceled,
+	context.DeadlineExceeded,
+}
+
+var knownNetworkErrors = []error{
+	io.EOF,
+	io.ErrUnexpectedEOF,
+	io.ErrClosedPipe,
+	os.ErrDeadlineExceeded,
+	redis.ErrPoolExhausted,
+}
+
+var networkSyscallErrnos = map[syscall.Errno]struct{}{
+	syscall.ECONNRESET:   {},
+	syscall.ECONNABORTED: {},
+	syscall.ECONNREFUSED: {},
+	syscall.EPIPE:        {},
+	syscall.ETIMEDOUT:    {},
+	syscall.ENETDOWN:     {},
+	syscall.ENETUNREACH:  {},
+	syscall.ENETRESET:    {},
+	syscall.ENOTCONN:     {},
+	syscall.ESHUTDOWN:    {},
+	syscall.EHOSTDOWN:    {},
+	syscall.EHOSTUNREACH: {},
+}
+
+const (
+	defaultInitialDelay             = 1 * time.Second
+	defaultMaxDelay                 = 30 * time.Second
+	defaultBackoffMultiplier        = 2.0
+	defaultPingTimeout              = 5 * time.Second
+	defaultReadDeadline             = 60 * time.Second
+	defaultResubscribeMaxWait       = 10 * time.Second
+	defaultResubscribeCheckInterval = 200 * time.Millisecond
 )
 
 // 连接状态
@@ -58,11 +95,11 @@ type ReconnectConfig struct {
 func DefaultReconnectConfig() *ReconnectConfig {
 	return &ReconnectConfig{
 		MaxRetries:        -1, // 无限重试
-		InitialDelay:      time.Second,
-		MaxDelay:          30 * time.Second,
-		BackoffMultiplier: 2.0,
+		InitialDelay:      defaultInitialDelay,
+		MaxDelay:          defaultMaxDelay,
+		BackoffMultiplier: defaultBackoffMultiplier,
 		Jitter:            true,
-		PingTimeout:       5 * time.Second,
+		PingTimeout:       defaultPingTimeout,
 	}
 }
 
@@ -250,7 +287,7 @@ func (sm *SubscriptionManager) subscriptionReceiver() {
 		}
 
 		if conn, ok := sm.pubsubConn.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(defaultReadDeadline))
 		}
 
 		msg := sm.pubsubConn.Receive()
@@ -300,6 +337,7 @@ func (sm *SubscriptionManager) handleMessage(msg interface{}) {
 
 // 尝试处理模式消息
 func (sm *SubscriptionManager) tryHandlePatternMessage(msg interface{}) bool {
+	// 处理 Redis 的原生模式消息结构
 	if arr, ok := msg.([]interface{}); ok && len(arr) >= 4 {
 		if msgType, ok := arr[0].([]byte); ok && string(msgType) == "pmessage" {
 			if pattern, ok := arr[1].([]byte); ok {
@@ -370,8 +408,8 @@ func (sm *SubscriptionManager) ResubscribeAll() error {
 	}
 	defer atomic.StoreInt32(&sm.resubscribing, 0)
 
-	maxWait := 10 * time.Second
-	checkInterval := 200 * time.Millisecond
+	maxWait := defaultResubscribeMaxWait
+	checkInterval := defaultResubscribeCheckInterval
 
 	for waited := time.Duration(0); waited < maxWait; waited += checkInterval {
 		if sm.client.GetState() == StateConnected {
@@ -503,528 +541,276 @@ type Client struct {
 	// 连接管理
 	pool *redis.Pool
 
-	// 状态管理
-	state int32 // atomic ConnectionState
-
-	// 重连控制
-	reconnectMu     sync.Mutex
-	reconnectCtx    context.Context
-	reconnectCancel context.CancelFunc
-	reconnecting    int32 // atomic
-	currentAttempt  int32 // atomic
-
 	// 订阅管理
 	subManager *SubscriptionManager
 
-	// 控制
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// 状态管理
+	state int32 // atomic
+
+	// 回调/状态容器
+	mu sync.RWMutex
 }
 
-// 创建客户端
-func NewClient(addr string) *Client {
-	return NewClientWithConfig(addr, "", 0, DefaultReconnectConfig())
-}
-
-func NewClientWithConfig(addr, password string, database int, config *ReconnectConfig) *Client {
-	if config == nil {
-		config = DefaultReconnectConfig()
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	client := &Client{
-		addr:            addr,
-		password:        password,
-		database:        database,
-		reconnectConfig: config,
-		ctx:             ctx,
-		cancel:          cancel,
-	}
-
-	client.setState(StateDisconnected)
-	client.initPool()
-	client.subManager = NewSubscriptionManager(client.pool, client)
-
-	return client
-}
-
-// 状态管理
-func (c *Client) setState(state ConnectionState) {
-	atomic.StoreInt32(&c.state, int32(state))
-}
-
-func (c *Client) GetState() ConnectionState {
-	return ConnectionState(atomic.LoadInt32(&c.state))
-}
-
-// 初始化连接池
-func (c *Client) initPool() {
-	c.pool = &redis.Pool{
-		MaxIdle:     10,
-		MaxActive:   100,
-		IdleTimeout: 300 * time.Second,
-		Wait:        true,
-
-		Dial: func() (redis.Conn, error) {
-			return c.createConnection()
-		},
-
-		TestOnBorrow: func(conn redis.Conn, t time.Time) error {
-			if time.Since(t) < 10*time.Minute {
-				return nil
-			}
-			return c.pingConnection(conn)
-		},
-	}
-}
-
-// 创建连接
-func (c *Client) createConnection() (redis.Conn, error) {
-	c.setState(StateConnecting)
-	if c.reconnectConfig.OnConnecting != nil {
-		go c.reconnectConfig.OnConnecting()
-	}
-
-	dialOptions := []redis.DialOption{
-		redis.DialConnectTimeout(5 * time.Second),
-		redis.DialReadTimeout(30 * time.Second),
-		redis.DialWriteTimeout(10 * time.Second),
-		redis.DialKeepAlive(60 * time.Second),
-	}
-
-	if c.password != "" {
-		dialOptions = append(dialOptions, redis.DialPassword(c.password))
-	}
-
-	if c.database != 0 {
-		dialOptions = append(dialOptions, redis.DialDatabase(c.database))
-	}
-
-	conn, err := redis.Dial("tcp", c.addr, dialOptions...)
-
-	if err != nil {
-		c.handleConnectionError(err)
-		return nil, err
-	}
-
-	c.handleConnectionSuccess()
-	return conn, nil
-}
-
-// 处理连接成功
-func (c *Client) handleConnectionSuccess() {
-	c.setState(StateConnected)
-	atomic.StoreInt32(&c.currentAttempt, 0)
-	atomic.StoreInt32(&c.reconnecting, 0)
-
-	if c.reconnectConfig.OnConnected != nil {
-		go c.reconnectConfig.OnConnected()
-	}
-
-	log.Printf("Redis连接成功: %s", c.addr)
-
-	go func() {
-		time.Sleep(time.Second)
-		if err := c.subManager.ResubscribeAll(); err != nil {
-			log.Printf("重新订阅失败: %v", err)
-		}
-	}()
-}
-
-// 处理连接错误
-func (c *Client) handleConnectionError(err error) {
-	oldState := c.GetState()
-	if oldState == StateReconnecting || oldState == StateConnecting {
-		return
-	}
-	c.setState(StateDisconnected)
-	if c.reconnectConfig.OnDisconnected != nil {
-		go c.reconnectConfig.OnDisconnected(err)
-	}
-
-	log.Printf("Redis连接失败: %v", err)
-	c.triggerReconnect()
-}
-
-// Ping连接测试
-func (c *Client) pingConnection(conn redis.Conn) error {
-	if c.reconnectConfig.PingTimeout > 0 {
-		if tcpConn, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
-			tcpConn.SetDeadline(time.Now().Add(c.reconnectConfig.PingTimeout))
-			defer tcpConn.SetDeadline(time.Time{})
-		}
-	}
-
-	_, err := conn.Do("PING")
-	if err != nil && isNetworkError(err) && c.GetState() != StateReconnecting {
-		c.handleConnectionError(err)
-	}
-
-	return err
-}
-
-// 触发重连
-func (c *Client) triggerReconnect() {
-	if !atomic.CompareAndSwapInt32(&c.reconnecting, 0, 1) {
-		return
-	}
-
-	c.reconnectMu.Lock()
-	defer c.reconnectMu.Unlock()
-
-	if c.reconnectCancel != nil {
-		c.reconnectCancel()
-	}
-
-	c.reconnectCtx, c.reconnectCancel = context.WithCancel(c.ctx)
-	c.wg.Add(1)
-	go c.reconnectLoop()
-}
-
-// 重连循环
-func (c *Client) reconnectLoop() {
-	defer c.wg.Done()
-	defer atomic.StoreInt32(&c.reconnecting, 0)
-
-	c.setState(StateReconnecting)
-	attempt := int(atomic.AddInt32(&c.currentAttempt, 1))
-
-	if c.reconnectConfig.OnReconnecting != nil {
-		go c.reconnectConfig.OnReconnecting(attempt)
-	}
-
-	log.Printf("开始重连尝试 #%d", attempt)
-
-	for {
-		select {
-		case <-c.reconnectCtx.Done():
-			return
-		default:
-		}
-
-		if c.reconnectConfig.MaxRetries > 0 && attempt > c.reconnectConfig.MaxRetries {
-			c.setState(StateFailed)
-			if c.reconnectConfig.OnGiveUp != nil {
-				go c.reconnectConfig.OnGiveUp(fmt.Errorf("超过最大重试次数: %d", c.reconnectConfig.MaxRetries))
-			}
-			log.Printf("重连失败，超过最大重试次数: %d", c.reconnectConfig.MaxRetries)
-			return
-		}
-
-		delay := c.calculateDelay(attempt)
-		log.Printf("重连尝试 #%d，%v后重试", attempt, delay)
-
-		select {
-		case <-c.reconnectCtx.Done():
-			return
-		case <-time.After(delay):
-		}
-
-		if c.attemptReconnect() {
-			if c.reconnectConfig.OnReconnected != nil {
-				go c.reconnectConfig.OnReconnected(attempt)
-			}
-
-			log.Printf("重连成功，尝试次数: %d", attempt)
-			return
-		}
-
-		attempt = int(atomic.AddInt32(&c.currentAttempt, 1))
-	}
-}
-
-// 计算重连延迟
-func (c *Client) calculateDelay(attempt int) time.Duration {
-	if attempt <= 0 {
-		return c.reconnectConfig.InitialDelay
-	}
-
-	base := float64(c.reconnectConfig.InitialDelay)
-	max := float64(c.reconnectConfig.MaxDelay)
-
-	delay := base * math.Pow(c.reconnectConfig.BackoffMultiplier, float64(attempt-1))
-
-	if delay > max {
-		delay = max
-	}
-
-	if c.reconnectConfig.Jitter {
-		jitterRange := delay * 0.15
-		jitter := (2*jitterRange)*float64(time.Now().UnixNano()%1000)/1000 - jitterRange
-		delay += jitter
-	}
-
-	return time.Duration(delay)
-}
-
-// 尝试重连
-func (c *Client) attemptReconnect() bool {
-	conn := c.pool.Get()
-	defer conn.Close()
-
-	if tcpConn, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
-		tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
-		defer tcpConn.SetDeadline(time.Time{})
-	}
-
-	_, err := conn.Do("PING")
-	if err != nil {
-		log.Printf("重连测试失败: %v", err)
-		return false
-	}
-
-	c.setState(StateConnected)
-	atomic.StoreInt32(&c.currentAttempt, 0)
-	atomic.StoreInt32(&c.reconnecting, 0)
-
-	if c.reconnectConfig.OnConnected != nil {
-		go c.reconnectConfig.OnConnected()
-	}
-
-	log.Printf("Redis重连成功: %s", c.addr)
-
-	go func() {
-		time.Sleep(time.Second)
-		if err := c.subManager.ResubscribeAll(); err != nil {
-			log.Printf("重新订阅失败: %v", err)
-		}
-	}()
-
-	return true
-}
-
-// 基础Redis操作
-func (c *Client) Do(commandName string, args ...interface{}) (interface{}, error) {
-	conn := c.pool.Get()
-	defer conn.Close()
-
-	reply, err := conn.Do(commandName, args...)
-	if err != nil && isNetworkError(err) {
-		c.handleConnectionError(err)
-	}
-
-	return reply, err
-}
-
-func (c *Client) Get(key string) (string, error) {
-	result, err := c.Do("GET", key)
-	if err != nil {
-		return "", err
-	}
-
-	if result == nil {
-		return "", redis.ErrNil
-	}
-
-	return string(result.([]byte)), nil
-}
-
-func (c *Client) Set(key string, value interface{}) error {
-	_, err := c.Do("SET", key, value)
-	return err
-}
-
-func (c *Client) Del(keys ...string) (int64, error) {
-	args := make([]interface{}, len(keys))
-	for i, key := range keys {
-		args[i] = key
-	}
-
-	result, err := c.Do("DEL", args...)
-	if err != nil {
-		return 0, err
-	}
-
-	return result.(int64), nil
-}
-
-func (c *Client) Ping() error {
-	_, err := c.Do("PING")
-	return err
-}
-
-// 订阅功能
-func (c *Client) Subscribe(channel string, handler func(channel, message string)) error {
-	return c.subManager.Subscribe(channel, handler)
-}
-
-func (c *Client) PSubscribe(pattern string, handler func(channel, message string)) error {
-	return c.subManager.PSubscribe(pattern, handler)
-}
-
-func (c *Client) Unsubscribe(channels ...string) error {
-	return c.subManager.Unsubscribe(channels...)
-}
-
-func (c *Client) PUnsubscribe(patterns ...string) error {
-	return c.subManager.PUnsubscribe(patterns...)
-}
-
-func (c *Client) Publish(channel string, message interface{}) (int64, error) {
-	result, err := c.Do("PUBLISH", channel, message)
-	if err != nil {
-		return 0, err
-	}
-
-	return result.(int64), nil
-}
-
-// 获取连接信息
-func (c *Client) GetConnectionInfo() map[string]interface{} {
-	return map[string]interface{}{
-		"state":           c.GetState().String(),
-		"current_attempt": atomic.LoadInt32(&c.currentAttempt),
-		"subscriptions":   c.subManager.GetSubscriptionCount(),
-		"reconnecting":    atomic.LoadInt32(&c.reconnecting) == 1,
-	}
-}
-
-// 关闭客户端
-func (c *Client) Close() error {
-	log.Println("开始关闭Redis客户端...")
-
-	c.cancel()
-
-	if c.reconnectCancel != nil {
-		c.reconnectCancel()
-	}
-
-	if c.subManager != nil {
-		c.subManager.Close()
-	}
-
-	done := make(chan struct{})
-	go func() {
-		c.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("所有协程已正常结束")
-	case <-time.After(10 * time.Second):
-		log.Println("等待协程结束超时，强制关闭")
-	}
-
-	var err error
-	if c.pool != nil {
-		err = c.pool.Close()
-	}
-
-	log.Println("Redis客户端已关闭")
-	return err
-}
-
-// 网络错误检查
+// Helper: 判断是否为网络错误
 func isNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isNonNetworkError(err) {
-		return false
-	}
-	if isKnownNetworkError(err) {
-		return true
-	}
-	if isNetworkInterfaceError(err) {
-		return true
-	}
-	if isNetworkSyscallError(err) {
-		return true
-	}
-
-	return false
-}
-
-// 检查已知的非网络错误
-func isNonNetworkError(err error) bool {
-	if errors.Is(err, redis.ErrNil) {
-		return true
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-
-	return false
-}
-
-// 检查已知的网络错误
-func isKnownNetworkError(err error) bool {
-	if errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe) {
-		return true
-	}
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	if errors.Is(err, redis.ErrPoolExhausted) {
-		return true
-	}
-
-	return false
-}
-
-func isNetworkInterfaceError(err error) bool {
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return true
-	}
-	var syscallErr syscall.Errno
-	if errors.As(err, &syscallErr) {
-		return isNetworkSyscallErrno(syscallErr)
-	}
-
-	return false
-}
-
-func isNetworkSyscallError(err error) bool {
-	networkErrnos := []error{
-		syscall.ECONNRESET,
-		syscall.ECONNABORTED,
-		syscall.ECONNREFUSED,
-		syscall.EPIPE,
-		syscall.ETIMEDOUT,
-		syscall.ENETDOWN,
-		syscall.ENETUNREACH,
-		syscall.ENETRESET,
-		syscall.ENOTCONN,
-		syscall.ESHUTDOWN,
-		syscall.EHOSTDOWN,
-		syscall.EHOSTUNREACH,
-	}
-
-	for _, errno := range networkErrnos {
-		if errors.Is(err, errno) {
+	for _, ne := range knownNetworkErrors {
+		if errors.Is(err, ne) {
 			return true
 		}
 	}
-
+	// 尝试检查 errno
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if _, ok := networkSyscallErrnos[errno]; ok {
+			return true
+		}
+	}
 	return false
 }
 
-func isNetworkSyscallErrno(errno syscall.Errno) bool {
-	switch errno {
-	case syscall.ECONNRESET,
-		syscall.ECONNABORTED,
-		syscall.ECONNREFUSED,
-		syscall.EPIPE,
-		syscall.ETIMEDOUT,
-		syscall.ENETDOWN,
-		syscall.ENETUNREACH,
-		syscall.ENETRESET,
-		syscall.ENOTCONN,
-		syscall.ESHUTDOWN,
-		syscall.EHOSTDOWN,
-		syscall.EHOSTUNREACH:
-		return true
-	default:
+// 颜色辅助：判断是否为非配置信息中需要忽略的错误
+func ignoreNonNetworkError(err error) bool {
+	for _, ne := range nonNetworkErrors {
+		if errors.Is(err, ne) {
+			return true
+		}
+	}
+	return false
+}
+
+// 构造新的客户端
+func NewClient(addr string, password string, db int, cfg *ReconnectConfig) *Client {
+	if cfg == nil {
+		cfg = DefaultReconnectConfig()
+	}
+	// 初始化连接池
+	pool := &redis.Pool{
+		MaxIdle:     10,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			options := []redis.DialOption{
+				redis.DialConnectTimeout(5 * time.Second),
+				redis.DialReadTimeout(5 * time.Second),
+				redis.DialWriteTimeout(5 * time.Second),
+			}
+			if password != "" {
+				options = append(options, redis.DialPassword(password))
+			}
+			// 指定数据库
+			options = append(options, redis.DialDatabase(db))
+			return redis.Dial("tcp", addr, options...)
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			return err
+		},
+	}
+	c := &Client{
+		addr:            addr,
+		password:        password,
+		database:        db,
+		reconnectConfig: cfg,
+		pool:            pool,
+		state:           int32(StateDisconnected),
+	}
+	c.subManager = NewSubscriptionManager(c.pool, c)
+	return c
+}
+
+// 连接到 Redis，验证连通性并触发就绪状态
+func (c *Client) Connect() error {
+	atomic.StoreInt32(&c.state, int32(StateConnecting))
+	// 回调：正在连接
+	if c.reconnectConfig != nil && c.reconnectConfig.OnConnecting != nil {
+		c.reconnectConfig.OnConnecting()
+	}
+	conn := c.pool.Get()
+	if conn == nil {
+		atomic.StoreInt32(&c.state, int32(StateDisconnected))
+		return errors.New("failed to obtain Redis connection")
+	}
+	defer conn.Close()
+
+	_, err := conn.Do("PING")
+	if err != nil {
+		atomic.StoreInt32(&c.state, int32(StateDisconnected))
+		// 启动重连循环
+		c.startReconnectionLoop(err)
+		return err
+	}
+
+	atomic.StoreInt32(&c.state, int32(StateConnected))
+	if c.reconnectConfig != nil && c.reconnectConfig.OnConnected != nil {
+		c.reconnectConfig.OnConnected()
+	}
+	return nil
+}
+
+// 内部：启动重连循环
+func (c *Client) startReconnectionLoop(firstErr error) {
+	cfg := c.reconnectConfig
+	if cfg == nil {
+		return
+	}
+	// 防御性：如果已经在连接状态，直接返回
+	if atomic.LoadInt32(&c.state) == int32(StateConnected) {
+		return
+	}
+
+	go func() {
+		attempt := 0
+		delay := cfg.InitialDelay
+		for {
+			// 达到最大重试次数时放弃
+			if cfg.MaxRetries >= 0 && attempt >= cfg.MaxRetries {
+				atomic.StoreInt32(&c.state, int32(StateFailed))
+				if cfg.OnGiveUp != nil {
+					cfg.OnGiveUp(errors.New("max reconnect attempts reached"))
+				}
+				return
+			}
+			// 回调：重新连接
+			if cfg.OnReconnecting != nil {
+				cfg.OnReconnecting(attempt)
+			}
+			// 等待
+			time.Sleep(delay)
+
+			// 尝试重新连接
+			if c.tryReconnect() {
+				atomic.StoreInt32(&c.state, int32(StateConnected))
+				if cfg.OnReconnected != nil {
+					cfg.OnReconnected(attempt)
+				}
+				return
+			}
+			// 失败后调整延迟
+			attempt++
+			// 退避策略与抖动
+			if cfg.Jitter {
+				j := time.Duration(rand.Int63n(int64(100))) * time.Millisecond
+				delay = time.Duration(float64(delay) * cfg.BackoffMultiplier)
+				if delay > cfg.MaxDelay {
+					delay = cfg.MaxDelay
+				}
+				delay += j
+			} else {
+				delay = time.Duration(float64(delay) * cfg.BackoffMultiplier)
+				if delay > cfg.MaxDelay {
+					delay = cfg.MaxDelay
+				}
+			}
+		}
+	}()
+}
+
+// 尝试进行一次重新连接检查
+func (c *Client) tryReconnect() bool {
+	// 使用现有的 pool 进行一次轻量的 PING
+	conn := c.pool.Get()
+	if conn == nil {
 		return false
 	}
+	defer conn.Close()
+
+	_, err := conn.Do("PING")
+	if err != nil {
+		return false
+	}
+	// 成功后，尝试重新订阅/恢复状态
+	if c.subManager != nil {
+		_ = c.subManager.ResubscribeAll()
+	}
+	return true
+}
+
+// 获取当前状态
+func (c *Client) GetState() ConnectionState {
+	return ConnectionState(atomic.LoadInt32(&c.state))
+}
+
+// 关闭客户端
+func (c *Client) Close() error {
+	if c.subManager != nil {
+		_ = c.subManager.Close()
+	}
+	if c.pool != nil {
+		return c.pool.Close()
+	}
+	return nil
+}
+
+func (c *Client) Subscribe(channel string, handler func(channel, message string)) error {
+	if c.subManager == nil {
+		c.subManager = NewSubscriptionManager(c.pool, c)
+	}
+	return c.subManager.Subscribe(channel, handler)
+}
+
+func (c *Client) PSubscribe(pattern string, handler func(channel, message string)) error {
+	if c.subManager == nil {
+		c.subManager = NewSubscriptionManager(c.pool, c)
+	}
+	return c.subManager.PSubscribe(pattern, handler)
+}
+
+func (c *Client) Unsubscribe(channels ...string) error {
+	if c.subManager == nil {
+		return nil
+	}
+	return c.subManager.Unsubscribe(channels...)
+}
+
+func (c *Client) PUnsubscribe(patterns ...string) error {
+	if c.subManager == nil {
+		return nil
+	}
+	return c.subManager.PUnsubscribe(patterns...)
+}
+
+func (c *Client) Publish(channel string, message interface{}) error {
+	conn := c.pool.Get()
+	if conn == nil {
+		return errors.New("no available redis connection")
+	}
+	defer conn.Close()
+
+	_, err := conn.Do("PUBLISH", channel, message)
+	return err
+}
+
+func (c *Client) Get(key string) (string, error) {
+	conn := c.pool.Get()
+	if conn == nil {
+		return "", errors.New("no available redis connection")
+	}
+	defer conn.Close()
+
+	return redis.String(conn.Do("GET", key))
+}
+
+func (c *Client) Set(key string, value interface{}) error {
+	conn := c.pool.Get()
+	if conn == nil {
+		return errors.New("no available redis connection")
+	}
+	defer conn.Close()
+
+	_, err := conn.Do("SET", key, value)
+	return err
+}
+
+func (c *Client) Send(channel string, payload interface{}) error {
+	return c.Publish(channel, payload)
+}
+
+func (c *Client) handleConnectionError(err error) {
+	if c.reconnectConfig != nil && c.reconnectConfig.OnDisconnected != nil {
+		c.reconnectConfig.OnDisconnected(err)
+	}
+	atomic.StoreInt32(&c.state, int32(StateDisconnected))
+	c.startReconnectionLoop(err)
 }
