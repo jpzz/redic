@@ -159,6 +159,10 @@ func NewSubscriptionManager(pool *redis.Pool, client *Client) *SubscriptionManag
 }
 
 func (sm *SubscriptionManager) Subscribe(channel string, handler func(channel, message string)) error {
+	if handler == nil {
+		return errors.New("handler cannot be nil")
+	}
+
 	sub := &SubscriptionInfo{
 		Channel:   channel,
 		Handler:   handler,
@@ -174,6 +178,10 @@ func (sm *SubscriptionManager) Subscribe(channel string, handler func(channel, m
 }
 
 func (sm *SubscriptionManager) PSubscribe(pattern string, handler func(channel, message string)) error {
+	if handler == nil {
+		return errors.New("handler cannot be nil")
+	}
+
 	sub := &SubscriptionInfo{
 		Pattern:   pattern,
 		Handler:   handler,
@@ -304,13 +312,28 @@ func (sm *SubscriptionManager) subscriptionReceiver() {
 func (sm *SubscriptionManager) handleMessage(msg interface{}) {
 	switch v := msg.(type) {
 	case redis.Message:
-		key := "channel:" + v.Channel
-		sm.mu.RLock()
-		sub, ok := sm.subscriptions[key]
-		sm.mu.RUnlock()
+		// 检查是否是模式消息
+		if v.Pattern != "" {
+			// 这是模式消息
+			key := "pattern:" + v.Pattern
+			sm.mu.RLock()
+			sub, ok := sm.subscriptions[key]
+			sm.mu.RUnlock()
 
-		if ok && sub.IsActive() && sub.Handler != nil {
-			go sm.safeHandleMessage(sub.Handler, v.Channel, string(v.Data))
+			if ok && sub.IsActive() && sub.Handler != nil {
+				// 对于模式消息，传递实际的频道名和消息内容
+				go sm.safeHandleMessage(sub.Handler, v.Channel, string(v.Data))
+			}
+		} else {
+			// 这是普通频道消息
+			key := "channel:" + v.Channel
+			sm.mu.RLock()
+			sub, ok := sm.subscriptions[key]
+			sm.mu.RUnlock()
+
+			if ok && sub.IsActive() && sub.Handler != nil {
+				go sm.safeHandleMessage(sub.Handler, v.Channel, string(v.Data))
+			}
 		}
 
 	case redis.Subscription:
@@ -527,6 +550,15 @@ func (sm *SubscriptionManager) Close() error {
 	sm.connMu.Unlock()
 
 	sm.wg.Wait()
+
+	// 清理所有订阅
+	sm.mu.Lock()
+	for _, sub := range sm.subscriptions {
+		sub.SetActive(false)
+	}
+	sm.subscriptions = make(map[string]*SubscriptionInfo)
+	sm.mu.Unlock()
+
 	return nil
 }
 
@@ -734,6 +766,9 @@ func (c *Client) GetState() ConnectionState {
 
 // 关闭客户端
 func (c *Client) Close() error {
+	// 更新状态为断开连接
+	atomic.StoreInt32(&c.state, int32(StateDisconnected))
+
 	if c.subManager != nil {
 		_ = c.subManager.Close()
 	}
